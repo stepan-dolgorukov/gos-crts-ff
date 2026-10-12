@@ -23,14 +23,15 @@
       profile = "\${XDG_DATA_HOME:-\${HOME:?set HOME or XDG_DATA_HOME}/.local/share}/firefox-esr-gos";
       certutil = "${pkgs.nss.tools}/bin/certutil";
 
-      # --profile is appended after "$@" so a user-supplied one wins (Firefox
-      # honours the first occurrence). -P selects a legacy profile and would
-      # lose to --profile whatever the order, so refuse it instead.
-      rejectProfileManager = ''
+      # Honouring a user-supplied profile would mean re-implementing Firefox's
+      # argument parsing (one or two dashes, case-insensitive) just to know which
+      # database to seed; get it subtly wrong and the browser runs with no trust
+      # anchors at all. Refuse those flags instead and point at XDG_DATA_HOME.
+      rejectProfileArgs = ''
         for arg; do
-          case $arg in
-            -P | --P | -ProfileManager | --ProfileManager)
-              echo "firefox-esr-gos: pinned to its own profile; use --profile DIR to override" >&2
+          case ''${arg,,} in
+            -p | --p | -profile | --profile | -profilemanager | --profilemanager)
+              echo "firefox-esr-gos: pins its own profile; set XDG_DATA_HOME to relocate it" >&2
               exit 2
               ;;
           esac
@@ -41,22 +42,26 @@
       # trust flags (153.4.0esr), so the browser still rejects them. Seed the
       # profile's own DB instead: the root as an SSL anchor, the sub CA untrusted
       # and only present so chains complete when a server omits it.
+      #
+      # Seeding must never keep the browser from starting: with a primary
+      # password set, certutil cannot log in to write trust flags, so it is run
+      # with stdin closed (it would otherwise prompt and hang) and a failure is
+      # only reported.
       seedCerts = ''
         prof="${profile}"
-        prev=
-        for arg; do
-          if [ "$prev" = --profile ]; then prof=$arg; fi
-          prev=$arg
-        done
         mkdir -p "$prof"
-        ${certutil} -A -a -t C,, -n "Russian Trusted Root CA" -i ${certs.root} -d "sql:$prof"
-        ${certutil} -A -a -t ,, -n "Russian Trusted Sub CA" -i ${certs.sub} -d "sql:$prof"
+        seed() {
+          ${certutil} -A -a -t C,, -n "Russian Trusted Root CA" -i ${certs.root} -d "sql:$prof" &&
+            ${certutil} -A -a -t ,, -n "Russian Trusted Sub CA" -i ${certs.sub} -d "sql:$prof"
+        }
+        seed </dev/null ||
+          echo "firefox-esr-gos: could not trust the MinCifry CAs in $prof (primary password?)" >&2
       '';
 
       firefox-esr-gos = pkgs.firefox-esr.overrideAttrs (old: {
         makeWrapperArgs = old.makeWrapperArgs ++ [
           "--run"
-          rejectProfileManager
+          rejectProfileArgs
           "--run"
           seedCerts
           "--append-flags"
@@ -90,11 +95,14 @@
             *) echo "no HOME guard: $msg" && exit 1 ;;
           esac
 
-          msg=$(${firefox-esr-gos}/${launcher} -P 2>&1 || true)
-          case $msg in
-            *"use --profile DIR"*) ;;
-            *) echo "-P not refused: $msg" && exit 1 ;;
-          esac
+          # Firefox accepts these with one or two dashes, in any case.
+          for flag in -P -p --p -profile --Profile -ProfileManager --profilemanager; do
+            msg=$(timeout 60 ${firefox-esr-gos}/${launcher} $flag 2>&1 || true)
+            case $msg in
+              *"set XDG_DATA_HOME to relocate"*) ;;
+              *) echo "$flag not refused: $msg" && exit 1 ;;
+            esac
+          done
 
           touch $out
         '';
@@ -127,16 +135,21 @@
           timeout 600 ${firefox-esr-gos}/${launcher} \
             --headless --screenshot $TMPDIR/pinned.png about:blank
           prof="$HOME/.local/share/firefox-esr-gos"
-          [ -d "$prof" ]
+          # prefs.js, not the directory: the wrapper's own mkdir -p creates the
+          # latter even when Firefox goes on to use some other profile.
+          [ -s "$prof/prefs.js" ]
           [ ! -e "$HOME/.config/mozilla/firefox/profiles.ini" ]
           trusted
 
-          # An explicit --profile wins, and gets the same trust anchors.
-          timeout 600 ${firefox-esr-gos}/${launcher} --profile $TMPDIR/alt \
-            --headless --screenshot $TMPDIR/alt.png about:blank
-          prof=$TMPDIR/alt
-          [ -s "$prof/prefs.js" ]
-          trusted
+          # XDG_DATA_HOME relocates the profile, and a primary password there
+          # costs the trust anchors but must never keep the browser from
+          # starting.
+          echo secret > $TMPDIR/pw
+          mkdir -p $TMPDIR/xdg/firefox-esr-gos
+          certutil -N -d "sql:$TMPDIR/xdg/firefox-esr-gos" -f $TMPDIR/pw
+          XDG_DATA_HOME=$TMPDIR/xdg timeout 600 ${firefox-esr-gos}/${launcher} \
+            --headless --screenshot $TMPDIR/locked.png about:blank
+          [ -s "$TMPDIR/xdg/firefox-esr-gos/prefs.js" ]
 
           touch $out
         '';
